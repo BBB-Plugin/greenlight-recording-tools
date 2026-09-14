@@ -74,12 +74,16 @@ def discover_recordings():
                 record_id = get_text(root, 'id') or Path(entry.path).name
                 meeting = root.find('meeting')
                 ext_id = ''
+                internal_meeting_id = ''
                 room_name = ''
                 if meeting is not None:
                     ext_id = (meeting.attrib.get('externalId') or '').strip()
+                    internal_meeting_id = (meeting.attrib.get('id') or '').strip()
                     room_name = (meeting.attrib.get('name') or '').strip()
                 meta = meta_map(root)
                 meeting_id = meta.get('meetingId', '').strip() or ext_id
+                if not internal_meeting_id:
+                    internal_meeting_id = record_id
                 if not room_name:
                     room_name = (
                         meta.get('bbb-context-name', '').strip()
@@ -94,6 +98,7 @@ def discover_recordings():
                     'state': state,
                     'record_id': record_id,
                     'meeting_id': meeting_id,
+                    'internal_meeting_id': internal_meeting_id,
                     'room_name': room_name,
                     'metadata': str(metadata),
                     'context_id': meta.get('bbb-context-id', '').strip(),
@@ -104,15 +109,22 @@ def discover_recordings():
                 print(f'WARN: skipping {metadata}: {exc}', file=sys.stderr)
 
 
+def run_greenlight_rails(ruby, env=None):
+    cmd = ['docker', 'exec']
+    for key, value in (env or {}).items():
+        cmd += ['-e', f'{key}={value}']
+    cmd += [GREENLIGHT_CONTAINER, 'bundle', 'exec', 'rails', 'runner', ruby]
+    try:
+        return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+    except FileNotFoundError:
+        fail('docker was not found; Greenlight operations require local Docker access')
+    except subprocess.CalledProcessError as exc:
+        fail(f'Greenlight Rails command failed in container {GREENLIGHT_CONTAINER}: {exc.output.strip()}')
+
+
 def greenlight_rooms():
     ruby = "Room.order(:created_at).pluck(:meeting_id,:friendly_id,:name).each{|r| puts r.map{|v| v.to_s.gsub(\"\\t\",\" \")}.join(\"\\t\") }"
-    cmd = ['docker', 'exec', GREENLIGHT_CONTAINER, 'bundle', 'exec', 'rails', 'runner', ruby]
-    try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-    except FileNotFoundError:
-        fail('docker was not found; Greenlight room validation requires local Docker access')
-    except subprocess.CalledProcessError as exc:
-        fail(f'Cannot query Greenlight rooms using container {GREENLIGHT_CONTAINER}: {exc.output.strip()}')
+    out = run_greenlight_rails(ruby)
     rooms = {}
     for line in out.splitlines():
         parts = line.split('\t')
@@ -142,23 +154,28 @@ def room_provenance():
 
 def cmd_rooms(args):
     detail, total, first_name = room_provenance()
-    existing = greenlight_rooms() if args.check_greenlight else {}
+    check_greenlight = args.check_greenlight or args.missing_only
+    existing = greenlight_rooms() if check_greenlight else {}
 
-    print('DETAIL: recording counts by meetingID + observed room name')
-    print('COUNT\tMEETING_ID\tROOM_NAME')
-    for (mid, name), count in sorted(detail.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1])):
-        print(f'{count}\t{mid}\t{name}')
+    if not args.missing_only:
+        print('DETAIL: recording counts by meetingID + observed room name')
+        print('COUNT\tMEETING_ID\tROOM_NAME')
+        for (mid, name), count in sorted(detail.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1])):
+            print(f'{count}\t{mid}\t{name}')
+        print('\nCONSOLIDATED: recording counts by meetingID')
 
-    print('\nCONSOLIDATED: recording counts by meetingID')
-    if args.check_greenlight:
+    if check_greenlight:
         print('COUNT\tEXISTS\tMEETING_ID\tROOM_NAME')
     else:
         print('COUNT\tMEETING_ID\tROOM_NAME')
 
     for mid, count in sorted(total.items(), key=lambda kv: (-kv[1], kv[0])):
+        if args.missing_only and (mid == '(missing)' or mid in existing):
+            continue
         name = first_name.get(mid, '(unknown)')
-        if args.check_greenlight:
-            print(f'{count}\t{\"yes\" if mid in existing else \"no\"}\t{mid}\t{name}')
+        if check_greenlight:
+            exists = 'yes' if mid in existing else 'no'
+            print(f'{count}\t{exists}\t{mid}\t{name}')
         else:
             print(f'{count}\t{mid}\t{name}')
 
@@ -169,7 +186,56 @@ def cmd_orphans(args):
     print('COUNT\tMEETING_ID\tROOM_NAME')
     for mid, count in sorted(total.items(), key=lambda kv: (-kv[1], kv[0])):
         if mid != '(missing)' and mid not in rooms:
-            print(f'{count}\t{mid}\t{names.get(mid, \"(unknown)\")}')
+            print(f'{count}\t{mid}\t{names.get(mid, "(unknown)")}')
+
+
+def cmd_bbb_record_ids(args):
+    sources = {x.strip() for x in args.meeting_ids.split(',') if x.strip()}
+    if not sources:
+        fail('No Greenlight meetingID supplied')
+    matches = [r for r in discover_recordings() if r['meeting_id'] in sources]
+    if not matches:
+        fail('No eligible Greenlight recordings found for supplied meetingID(s)')
+    matches.sort(key=lambda r: (r['meeting_id'], r['internal_meeting_id'], r['state']))
+    print('STATE\tMEETING_ID\tROOM_NAME\tINTERNAL_MEETING_ID\tRECORD_ID\tBBB_RECORD_DELETE')
+    for r in matches:
+        internal_id = r['internal_meeting_id'] or r['record_id']
+        print(
+            f"{r['state']}\t{r['meeting_id']}\t{r['room_name'] or '(unknown)'}\t"
+            f"{internal_id}\t{r['record_id']}\tbbb-record --delete {internal_id}"
+        )
+
+
+def cmd_create_room(args):
+    ruby = r'''
+name = ENV.fetch('GLRT_ROOM_NAME')
+email = ENV['GLRT_USER_EMAIL'].to_s.strip
+if email.empty?
+  role = Role.find_by(name: 'SuperAdmin', provider: 'bn')
+  abort('ERROR: SuperAdmin role not found') if role.nil?
+  users = User.where(role_id: role.id).to_a
+  abort("ERROR: expected exactly one SuperAdmin user, found #{users.length}; use --user EMAIL") unless users.length == 1
+  user = users.first
+else
+  users = User.where('LOWER(email) = ?', email.downcase).to_a
+  abort("ERROR: user not found: #{email}") if users.empty?
+  abort("ERROR: multiple users found for email #{email}") unless users.length == 1
+  user = users.first
+end
+existing = Room.where(user_id: user.id).where('LOWER(name) = ?', name.downcase).first
+if existing
+  puts ['EXISTS', existing.meeting_id, existing.friendly_id, user.email, existing.name].join("\t")
+else
+  room = Room.create!(name: name, user_id: user.id)
+  puts ['CREATED', room.meeting_id, room.friendly_id, user.email, room.name].join("\t")
+end
+'''.strip()
+    env = {'GLRT_ROOM_NAME': args.name}
+    if args.user:
+        env['GLRT_USER_EMAIL'] = args.user
+    out = run_greenlight_rails(ruby, env=env)
+    print('STATUS\tMEETING_ID\tFRIENDLY_ID\tOWNER_EMAIL\tROOM_NAME')
+    print(out.strip())
 
 
 def find_recording_formats(state, record_id):
@@ -350,6 +416,7 @@ def cmd_inspect(args):
             print(f"state: {r['state']}")
             print(f"recordID: {r['record_id']}")
             print(f"meetingID: {r['meeting_id']}")
+            print(f"internal meetingID: {r['internal_meeting_id']}")
             print(f"room name: {r['room_name']}")
             print(f"bbb-context-id: {r['context_id']}")
             print(f"reference metadata: {r['metadata']}")
@@ -365,10 +432,20 @@ def build_parser():
 
     cmd = sub.add_parser('rooms', help='report Greenlight recording provenance by historical meetingID')
     cmd.add_argument('--check-greenlight', action='store_true', help='mark whether each meetingID currently exists as a Greenlight Room')
+    cmd.add_argument('--missing-only', action='store_true', help='show only meetingIDs that do not currently exist as Greenlight Rooms; implies --check-greenlight')
     cmd.set_defaults(func=cmd_rooms)
 
     cmd = sub.add_parser('orphans', help='list recording meetingIDs that no longer exist as Greenlight Rooms')
     cmd.set_defaults(func=cmd_orphans)
+
+    cmd = sub.add_parser('bbb-record-ids', help='list internal meetingIDs usable with bbb-record --delete')
+    cmd.add_argument('meeting_ids', help='one or more Greenlight/external meetingIDs separated by commas')
+    cmd.set_defaults(func=cmd_bbb_record_ids)
+
+    cmd = sub.add_parser('create-room', help='create a Greenlight Room for SuperAdmin or a specified user')
+    cmd.add_argument('name', help='room name')
+    cmd.add_argument('--user', metavar='EMAIL', help='room owner email; defaults to the unique SuperAdmin user')
+    cmd.set_defaults(func=cmd_create_room)
 
     cmd = sub.add_parser('inspect', help='inspect one eligible Greenlight recording')
     cmd.add_argument('record_id')
