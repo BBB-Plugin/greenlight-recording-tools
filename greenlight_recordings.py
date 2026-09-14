@@ -206,6 +206,46 @@ def cmd_bbb_record_ids(args):
         )
 
 
+def cmd_delete_recordings(args):
+    sources = {x.strip() for x in args.meeting_ids.split(',') if x.strip()}
+    if not sources:
+        fail('No Greenlight meetingID supplied')
+    matches = [r for r in discover_recordings() if r['meeting_id'] in sources]
+    if not matches:
+        fail('No eligible Greenlight recordings found for supplied meetingID(s)')
+
+    prepared = []
+    for r in matches:
+        formats = find_recording_formats(r['state'], r['record_id'])
+        if not formats:
+            fail(f"No format metadata found for {r['record_id']} in {r['state']}")
+        for fmt, old_dir, metadata in formats:
+            if not is_greenlight_metadata(metadata):
+                fail(f'Safety invariant failed for {metadata}: bbb-origin is not greenlight')
+        prepared.append(r)
+
+    prepared.sort(key=lambda r: (r['meeting_id'], r['internal_meeting_id'], r['state']))
+    failures = []
+    deleted = 0
+    print(f'Found {len(prepared)} eligible recording(s).')
+    for r in prepared:
+        internal_id = r['internal_meeting_id'] or r['record_id']
+        proc = subprocess.run(
+            ['bbb-record', '--delete', internal_id],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if proc.returncode == 0:
+            deleted += 1
+            print(f"DELETED\t{r['state']}\t{r['meeting_id']}\t{internal_id}\t{r['room_name'] or '(unknown)'}")
+        else:
+            failures.append((internal_id, proc.stdout.strip()))
+            print(f"FAILED\t{r['state']}\t{r['meeting_id']}\t{internal_id}\t{proc.stdout.strip()}", file=sys.stderr)
+    if failures:
+        fail(f'Deleted {deleted} recording(s), but {len(failures)} deletion(s) failed')
+
+
 def cmd_create_room(args):
     ruby = r'''
 name = ENV.fetch('GLRT_ROOM_NAME')
@@ -235,6 +275,66 @@ end
         env['GLRT_USER_EMAIL'] = args.user
     out = run_greenlight_rails(ruby, env=env)
     print('STATUS\tMEETING_ID\tFRIENDLY_ID\tOWNER_EMAIL\tROOM_NAME')
+    print(out.strip())
+
+
+def cmd_delete_room(args):
+    ruby = r'''
+name = ENV.fetch('GLRT_ROOM_NAME')
+rooms = Room.where(name: name).includes(:user).to_a
+abort("ERROR: room not found: #{name}") if rooms.empty?
+abort("ERROR: multiple rooms named #{name}; use a unique name") unless rooms.length == 1
+room = rooms.first
+meeting_id = room.meeting_id
+owner = room.user.email
+recordings = room.recordings.count
+not_found = 0
+api = BigBlueButtonApi.new(provider: room.user.provider)
+room.recordings.includes(:formats).find_each do |recording|
+  begin
+    api.delete_recordings(record_ids: recording.record_id)
+  rescue StandardError => e
+    raise unless e.message.include?('notFound')
+    not_found += 1
+  end
+  recording.formats.delete_all
+  recording.delete
+end
+room.destroy!
+puts ['DELETED', meeting_id, owner, recordings, not_found, name].join("\t")
+'''.strip()
+    out = run_greenlight_rails(ruby, env={'GLRT_ROOM_NAME': args.name})
+    print('STATUS\tMEETING_ID\tOWNER_EMAIL\tRECORDINGS\tALREADY_MISSING_IN_BBB\tROOM_NAME')
+    print(out.strip())
+
+
+def cmd_delete_room_recordings(args):
+    ruby = r'''
+name = ENV.fetch('GLRT_ROOM_NAME')
+rooms = Room.where(name: name).includes(:user).to_a
+abort("ERROR: room not found: #{name}") if rooms.empty?
+abort("ERROR: multiple rooms named #{name}; use a unique name") unless rooms.length == 1
+room = rooms.first
+meeting_id = room.meeting_id
+owner = room.user.email
+recordings = room.recordings.count
+not_found = 0
+api = BigBlueButtonApi.new(provider: room.user.provider)
+room.recordings.includes(:formats).find_each do |recording|
+  begin
+    api.delete_recordings(record_ids: recording.record_id)
+  rescue StandardError => e
+    raise unless e.message.include?('notFound')
+    not_found += 1
+  end
+  recording.formats.delete_all
+  recording.delete
+end
+remaining = room.reload.recordings.count
+puts ['RECORDINGS_DELETED', meeting_id, owner, recordings, not_found, remaining, name].join("\t")
+'''.strip()
+    out = run_greenlight_rails(ruby, env={'GLRT_ROOM_NAME': args.name})
+    print('STATUS\tMEETING_ID\tOWNER_EMAIL\tDELETED\tALREADY_MISSING_IN_BBB\tREMAINING\tROOM_NAME')
     print(out.strip())
 
 
@@ -295,8 +395,10 @@ def atomic_write_tree(tree, path):
     os.close(fd)
     tmp = Path(tmp_name)
     try:
+        original_stat = path.stat()
         tree.write(tmp, encoding='utf-8', xml_declaration=True)
         shutil.copystat(path, tmp)
+        os.chown(tmp, original_stat.st_uid, original_stat.st_gid)
         os.replace(tmp, path)
     finally:
         if tmp.exists():
@@ -442,10 +544,22 @@ def build_parser():
     cmd.add_argument('meeting_ids', help='one or more Greenlight/external meetingIDs separated by commas')
     cmd.set_defaults(func=cmd_bbb_record_ids)
 
+    cmd = sub.add_parser('delete-recordings', help='delete eligible Greenlight recordings for one or more historical meetingIDs')
+    cmd.add_argument('meeting_ids', help='one or more Greenlight/external meetingIDs separated by commas')
+    cmd.set_defaults(func=cmd_delete_recordings)
+
     cmd = sub.add_parser('create-room', help='create a Greenlight Room for SuperAdmin or a specified user')
     cmd.add_argument('name', help='room name')
     cmd.add_argument('--user', metavar='EMAIL', help='room owner email; defaults to the unique SuperAdmin user')
     cmd.set_defaults(func=cmd_create_room)
+
+    cmd = sub.add_parser('delete-room', help='delete one exact Greenlight Room and its recordings')
+    cmd.add_argument('name', help='exact room name; operation fails if zero or multiple rooms match')
+    cmd.set_defaults(func=cmd_delete_room)
+
+    cmd = sub.add_parser('delete-room-recordings', help='delete all recordings for one exact Greenlight Room but keep the Room')
+    cmd.add_argument('name', help='exact room name; operation fails if zero or multiple rooms match')
+    cmd.set_defaults(func=cmd_delete_room_recordings)
 
     cmd = sub.add_parser('inspect', help='inspect one eligible Greenlight recording')
     cmd.add_argument('record_id')
