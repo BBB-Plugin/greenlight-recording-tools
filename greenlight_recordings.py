@@ -41,10 +41,7 @@ def meta_map(root):
     meta = root.find('meta')
     if meta is None:
         return {}
-    result = {}
-    for child in list(meta):
-        result[child.tag] = (child.text or '').strip()
-    return result
+    return {child.tag: (child.text or '').strip() for child in list(meta)}
 
 
 def is_greenlight_metadata(path):
@@ -54,6 +51,7 @@ def is_greenlight_metadata(path):
 
 
 def discover_recordings():
+    """Discover only from <state>/presentation/<recordID>/metadata.xml, following symlinks."""
     seen = set()
     for state in STATES:
         base = BBB_ROOT / state / DISCOVERY_FORMAT
@@ -83,7 +81,11 @@ def discover_recordings():
                 meta = meta_map(root)
                 meeting_id = meta.get('meetingId', '').strip() or ext_id
                 if not room_name:
-                    room_name = meta.get('bbb-context-name', '').strip() or meta.get('meeting-name', '').strip() or meta.get('meetingName', '').strip()
+                    room_name = (
+                        meta.get('bbb-context-name', '').strip()
+                        or meta.get('meeting-name', '').strip()
+                        or meta.get('meetingName', '').strip()
+                    )
                 key = (state, record_id)
                 if key in seen:
                     continue
@@ -107,6 +109,8 @@ def greenlight_rooms():
     cmd = ['docker', 'exec', GREENLIGHT_CONTAINER, 'bundle', 'exec', 'rails', 'runner', ruby]
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+    except FileNotFoundError:
+        fail('docker was not found; Greenlight room validation requires local Docker access')
     except subprocess.CalledProcessError as exc:
         fail(f'Cannot query Greenlight rooms using container {GREENLIGHT_CONTAINER}: {exc.output.strip()}')
     rooms = {}
@@ -118,55 +122,58 @@ def greenlight_rooms():
     return rooms
 
 
-def cmd_rooms(args):
-    recs = list(discover_recordings())
-    grouped = Counter()
-    names = defaultdict(list)
-    for r in recs:
+def room_provenance():
+    detail = Counter()
+    for r in discover_recordings():
         mid = r['meeting_id'] or '(missing)'
         name = r['room_name'] or '(unknown)'
-        grouped[(mid, name)] += 1
-        names[mid].append((name, grouped[(mid, name)]))
+        detail[(mid, name)] += 1
 
-    consolidated = []
-    per_mid = defaultdict(int)
-    first_name = {}
-    for (mid, name), count in grouped.items():
-        per_mid[mid] += count
-        if mid not in first_name or first_name[mid] in ('', '(unknown)'):
-            first_name[mid] = name
+    total = defaultdict(int)
+    first_known_name = {}
+    for (mid, name), count in detail.items():
+        total[mid] += count
+        if mid not in first_known_name:
+            first_known_name[mid] = name
+        elif first_known_name[mid] == '(unknown)' and name != '(unknown)':
+            first_known_name[mid] = name
+    return detail, total, first_known_name
 
+
+def cmd_rooms(args):
+    detail, total, first_name = room_provenance()
     existing = greenlight_rooms() if args.check_greenlight else {}
-    for mid, count in per_mid.items():
-        consolidated.append((count, mid, first_name.get(mid, '(unknown)'), mid in existing if args.check_greenlight else None))
-    consolidated.sort(key=lambda x: (-x[0], x[1]))
 
+    print('DETAIL: recording counts by meetingID + observed room name')
+    print('COUNT\tMEETING_ID\tROOM_NAME')
+    for (mid, name), count in sorted(detail.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1])):
+        print(f'{count}\t{mid}\t{name}')
+
+    print('\nCONSOLIDATED: recording counts by meetingID')
     if args.check_greenlight:
         print('COUNT\tEXISTS\tMEETING_ID\tROOM_NAME')
-        for count, mid, name, exists in consolidated:
-            print(f'{count}\t{\"yes\" if exists else \"no\"}\t{mid}\t{name}')
     else:
         print('COUNT\tMEETING_ID\tROOM_NAME')
-        for count, mid, name, _ in consolidated:
+
+    for mid, count in sorted(total.items(), key=lambda kv: (-kv[1], kv[0])):
+        name = first_name.get(mid, '(unknown)')
+        if args.check_greenlight:
+            print(f'{count}\t{\"yes\" if mid in existing else \"no\"}\t{mid}\t{name}')
+        else:
             print(f'{count}\t{mid}\t{name}')
 
 
 def cmd_orphans(args):
     rooms = greenlight_rooms()
-    counts = Counter()
-    names = {}
-    for r in discover_recordings():
-        mid = r['meeting_id']
-        if mid and mid not in rooms:
-            counts[mid] += 1
-            if mid not in names or not names[mid]:
-                names[mid] = r['room_name']
+    _, total, names = room_provenance()
     print('COUNT\tMEETING_ID\tROOM_NAME')
-    for mid, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
-        print(f'{count}\t{mid}\t{names.get(mid, \"\")}')
+    for mid, count in sorted(total.items(), key=lambda kv: (-kv[1], kv[0])):
+        if mid != '(missing)' and mid not in rooms:
+            print(f'{count}\t{mid}\t{names.get(mid, \"(unknown)\")}')
 
 
 def find_recording_formats(state, record_id):
+    """Find every <state>/<format>/<recordID>/metadata.xml, following format symlinks."""
     base = BBB_ROOT / state
     found = []
     if not base.exists():
@@ -185,8 +192,7 @@ def find_recording_formats(state, record_id):
 
 
 def validate_destination_room(destination_meeting_id):
-    rooms = greenlight_rooms()
-    room = rooms.get(destination_meeting_id)
+    room = greenlight_rooms().get(destination_meeting_id)
     if not room:
         fail(f'Destination meetingID is not an existing Greenlight room: {destination_meeting_id}')
     return room
@@ -205,17 +211,16 @@ def update_metadata_tree(tree, new_record_id, destination_meeting_id, room):
             meeting.set('name', room['name'])
     meta = root.find('meta')
     if meta is not None:
-        def set_meta(tag, value):
+        def set_existing_meta(tag, value):
             node = meta.find(tag)
             if node is not None:
                 node.text = value
-        set_meta('meetingId', destination_meeting_id)
-        set_meta('bbb-context-id', room.get('friendly_id', ''))
+        set_existing_meta('meetingId', destination_meeting_id)
+        set_existing_meta('bbb-context-id', room.get('friendly_id', ''))
         if room.get('name'):
-            set_meta('bbb-context-name', room['name'])
-            set_meta('meeting-name', room['name'])
-            set_meta('meetingName', room['name'])
-    # Update playback URLs and any other textual references to the old recording ID later in caller.
+            set_existing_meta('bbb-context-name', room['name'])
+            set_existing_meta('meeting-name', room['name'])
+            set_existing_meta('meetingName', room['name'])
 
 
 def atomic_write_tree(tree, path):
@@ -237,14 +242,14 @@ def replace_text_recursive(elem, old, new):
         elem.text = elem.text.replace(old, new)
     if elem.tail and old in elem.tail:
         elem.tail = elem.tail.replace(old, new)
-    for k, v in list(elem.attrib.items()):
-        if old in v:
-            elem.attrib[k] = v.replace(old, new)
+    for key, value in list(elem.attrib.items()):
+        if old in value:
+            elem.attrib[key] = value.replace(old, new)
     for child in list(elem):
         replace_text_recursive(child, old, new)
 
 
-def move_one(record, destination_meeting_id):
+def move_one(record, destination_meeting_id, room=None):
     state = record['state']
     old_record_id = record['record_id']
     if '-' not in old_record_id:
@@ -254,7 +259,7 @@ def move_one(record, destination_meeting_id):
     if new_record_id == old_record_id:
         fail(f'Recording already belongs to destination meetingID: {old_record_id}')
 
-    room = validate_destination_room(destination_meeting_id)
+    room = room or validate_destination_room(destination_meeting_id)
     formats = find_recording_formats(state, old_record_id)
     if not formats:
         fail(f'No format metadata found for {old_record_id} in {state}')
@@ -262,31 +267,55 @@ def move_one(record, destination_meeting_id):
     prepared = []
     for fmt, old_dir, metadata in formats:
         tree = parse_xml(metadata)
-        if meta_map(tree.getroot()).get('bbb-origin', '').strip().lower() != 'greenlight':
+        origin = meta_map(tree.getroot()).get('bbb-origin', '').strip().lower()
+        if origin != 'greenlight':
             fail(f'Safety invariant failed for {metadata}: bbb-origin is not greenlight')
         target_dir = old_dir.parent / new_record_id
         if target_dir.exists():
             fail(f'Target directory already exists: {target_dir}')
+        original_bytes = metadata.read_bytes()
+        original_stat = metadata.stat()
         update_metadata_tree(tree, new_record_id, destination_meeting_id, room)
         replace_text_recursive(tree.getroot(), old_record_id, new_record_id)
-        prepared.append((fmt, old_dir, target_dir, metadata, tree))
+        prepared.append({
+            'fmt': fmt,
+            'old_dir': old_dir,
+            'target_dir': target_dir,
+            'tree': tree,
+            'original_bytes': original_bytes,
+            'mode': original_stat.st_mode,
+            'uid': original_stat.st_uid,
+            'gid': original_stat.st_gid,
+        })
 
-    # Rename directories first; if any rename fails, roll back completed renames.
     renamed = []
+    written = []
     try:
-        for fmt, old_dir, target_dir, metadata, tree in prepared:
-            os.rename(old_dir, target_dir)
-            renamed.append((target_dir, old_dir))
-        for fmt, old_dir, target_dir, metadata, tree in prepared:
-            atomic_write_tree(tree, target_dir / 'metadata.xml')
+        for item in prepared:
+            os.rename(item['old_dir'], item['target_dir'])
+            renamed.append(item)
+        for item in prepared:
+            target_metadata = item['target_dir'] / 'metadata.xml'
+            atomic_write_tree(item['tree'], target_metadata)
+            written.append(item)
     except Exception as exc:
-        for target_dir, old_dir in reversed(renamed):
+        rollback_errors = []
+        for item in written:
             try:
-                if target_dir.exists() and not old_dir.exists():
-                    os.rename(target_dir, old_dir)
-            except Exception:
-                pass
-        fail(f'Move failed and rollback was attempted: {exc}')
+                target_metadata = item['target_dir'] / 'metadata.xml'
+                target_metadata.write_bytes(item['original_bytes'])
+                os.chmod(target_metadata, item['mode'])
+                os.chown(target_metadata, item['uid'], item['gid'])
+            except Exception as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        for item in reversed(renamed):
+            try:
+                if item['target_dir'].exists() and not item['old_dir'].exists():
+                    os.rename(item['target_dir'], item['old_dir'])
+            except Exception as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        extra = f'; rollback errors: {rollback_errors}' if rollback_errors else ''
+        fail(f'Move failed; rollback attempted: {exc}{extra}')
 
     print(f'MOVED\t{state}\t{old_record_id}\t{new_record_id}\t{destination_meeting_id}\tformats={len(formats)}')
 
@@ -296,7 +325,7 @@ def cmd_move_recording(args):
     if not matches:
         fail(f'Greenlight recording not found: {args.record_id}')
     if len(matches) > 1:
-        fail(f'RecordID appears in multiple states; use a unique recording/state before moving: {args.record_id}')
+        fail(f'RecordID appears in multiple states: {args.record_id}')
     move_one(matches[0], args.to)
 
 
@@ -304,13 +333,15 @@ def cmd_move_room(args):
     sources = {x.strip() for x in args.source_meeting_ids.split(',') if x.strip()}
     if not sources:
         fail('No source meetingID supplied')
-    validate_destination_room(args.to)
+    if args.to in sources:
+        fail('Destination meetingID must not also be a source meetingID')
+    room = validate_destination_room(args.to)
     matches = [r for r in discover_recordings() if r['meeting_id'] in sources]
     if not matches:
         fail('No eligible Greenlight recordings found for supplied source meetingID(s)')
     print(f'Found {len(matches)} eligible recording(s).')
-    for r in matches:
-        move_one(r, args.to)
+    for record in matches:
+        move_one(record, args.to, room=room)
 
 
 def cmd_inspect(args):
@@ -322,45 +353,44 @@ def cmd_inspect(args):
             print(f"room name: {r['room_name']}")
             print(f"bbb-context-id: {r['context_id']}")
             print(f"reference metadata: {r['metadata']}")
-            fmts = find_recording_formats(r['state'], r['record_id'])
-            print('formats: ' + ', '.join(sorted(f[0] for f in fmts)))
+            formats = find_recording_formats(r['state'], r['record_id'])
+            print('formats: ' + ', '.join(sorted(item[0] for item in formats)))
             return
     fail(f'Greenlight recording not found: {args.record_id}')
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog='greenlight-recordings')
-    sub = p.add_subparsers(dest='command', required=True)
+    parser = argparse.ArgumentParser(prog='greenlight-recordings')
+    sub = parser.add_subparsers(dest='command', required=True)
 
-    q = sub.add_parser('rooms', help='report recording provenance grouped by historical meetingID')
-    q.add_argument('--check-greenlight', action='store_true', help='mark whether each meetingID currently exists as a Greenlight Room')
-    q.set_defaults(func=cmd_rooms)
+    cmd = sub.add_parser('rooms', help='report Greenlight recording provenance by historical meetingID')
+    cmd.add_argument('--check-greenlight', action='store_true', help='mark whether each meetingID currently exists as a Greenlight Room')
+    cmd.set_defaults(func=cmd_rooms)
 
-    q = sub.add_parser('orphans', help='list recording meetingIDs that do not exist in Greenlight')
-    q.set_defaults(func=cmd_orphans)
+    cmd = sub.add_parser('orphans', help='list recording meetingIDs that no longer exist as Greenlight Rooms')
+    cmd.set_defaults(func=cmd_orphans)
 
-    q = sub.add_parser('inspect', help='inspect one eligible Greenlight recording')
-    q.add_argument('record_id')
-    q.set_defaults(func=cmd_inspect)
+    cmd = sub.add_parser('inspect', help='inspect one eligible Greenlight recording')
+    cmd.add_argument('record_id')
+    cmd.set_defaults(func=cmd_inspect)
 
-    q = sub.add_parser('move-recording', help='reassign one recording to an existing Greenlight Room')
-    q.add_argument('record_id')
-    q.add_argument('--to', required=True, metavar='DESTINATION_MEETING_ID')
-    q.set_defaults(func=cmd_move_recording)
+    cmd = sub.add_parser('move-recording', help='reassign one recording to an existing Greenlight Room')
+    cmd.add_argument('record_id')
+    cmd.add_argument('--to', required=True, metavar='DESTINATION_MEETING_ID')
+    cmd.set_defaults(func=cmd_move_recording)
 
-    q = sub.add_parser('move-room', help='reassign all recordings from one or more historical meetingIDs')
-    q.add_argument('source_meeting_ids', help='one or more source meetingIDs separated by commas')
-    q.add_argument('--to', required=True, metavar='DESTINATION_MEETING_ID')
-    q.set_defaults(func=cmd_move_room)
+    cmd = sub.add_parser('move-room', help='reassign all recordings from one or more historical meetingIDs')
+    cmd.add_argument('source_meeting_ids', help='one or more source meetingIDs separated by commas')
+    cmd.add_argument('--to', required=True, metavar='DESTINATION_MEETING_ID')
+    cmd.set_defaults(func=cmd_move_room)
 
-    return p
+    return parser
 
 
 def main():
     if os.geteuid() != 0:
         fail('This CLI must run as root because BBB recording trees may require privileged access')
-    parser = build_parser()
-    args = parser.parse_args()
+    args = build_parser().parse_args()
     args.func(args)
 
 
