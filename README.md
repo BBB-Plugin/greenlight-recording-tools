@@ -1,6 +1,6 @@
 # Greenlight Recording Tools
 
-CLI utilities to audit, recover, and reassign BigBlueButton recordings created by Greenlight.
+CLI utilities to audit, recover, reassign, and safely delete BigBlueButton recordings created by Greenlight.
 
 ## Non-negotiable safety invariant
 
@@ -78,7 +78,7 @@ greenlight-recordings orphans
 
 ## BigBlueButton internal meeting IDs
 
-`bbb-record --delete` expects a BigBlueButton **internal meetingID**, not the Greenlight/external meetingID. Historical recordings may no longer be resolvable by `bbb-record --tointernal`, so this CLI reads the internal ID directly from each eligible Greenlight `metadata.xml`.
+`bbb-record --delete` expects a BigBlueButton internal meetingID, not the Greenlight/external meetingID. Historical recordings may no longer be resolvable by `bbb-record --tointernal`, so this CLI reads the internal ID directly from each eligible Greenlight `metadata.xml`.
 
 List delete-compatible internal IDs for one or several Greenlight/external meetingIDs:
 
@@ -87,6 +87,16 @@ greenlight-recordings bbb-record-ids <meetingID[,meetingID,...]>
 ```
 
 The command is read-only. It prints the recording state, external meetingID, room name, internal meetingID, recordID, and the corresponding `bbb-record --delete <internal-meetingID>` command. It never executes the delete.
+
+## Delete historical/orphan recordings
+
+Delete all eligible Greenlight recordings belonging to one or more historical meetingIDs:
+
+```bash
+greenlight-recordings delete-recordings <meetingID[,meetingID,...]>
+```
+
+Before deletion, every discovered format-specific `metadata.xml` must pass the `bbb-origin=greenlight` safety invariant. The command then invokes `bbb-record --delete` for each recording.
 
 ## Inspect one recording
 
@@ -112,6 +122,24 @@ greenlight-recordings create-room "Historical recordings" --user user@example.co
 
 The command uses Greenlight's normal Rails `Room` model, so Greenlight generates the Room `meeting_id` and `friendly_id`. Before creating, it checks whether the same owner already has a Room with the same name; in that case it returns `EXISTS` instead of creating a duplicate. If more than one SuperAdmin exists, `--user` is required.
 
+A Room inherits its owner's Greenlight provider. SuperAdmin accounts normally use provider `bn`. On installations that have direct `BIGBLUEBUTTON_*` credentials but no `LOADBALANCER_*` credentials, room-recording deletion commands automatically fall back to the direct `greenlight` BBB provider for the API operation. This does not change the Room owner or the user's provider.
+
+## Delete a Room or only its recordings
+
+Delete all recordings associated with one exact current Greenlight Room while preserving the Room itself:
+
+```bash
+greenlight-recordings delete-room-recordings "Exact Room Name"
+```
+
+Delete one exact Greenlight Room together with all recordings associated with it:
+
+```bash
+greenlight-recordings delete-room "Exact Room Name"
+```
+
+Both commands fail without changing anything when zero or multiple Rooms have the supplied exact name. Recording deletion uses Greenlight/BBB APIs and tolerates only BBB `notFound` responses for recordings that were already removed; any other BBB error aborts the operation.
+
 ## Reassignment
 
 Move one recording to an existing destination Greenlight Room:
@@ -128,7 +156,9 @@ greenlight-recordings move-room <source-meetingID[,source-meetingID,...]> --to <
 
 Before a recording modification, every format-specific metadata file found for that recording must explicitly have `bbb-origin=greenlight`. If any format fails that invariant, the operation aborts.
 
-The reassignment derives a new BigBlueButton internal recording ID as `SHA1(destination meetingID)-timestamp`, renames every discovered format directory, updates corresponding metadata, and preserves the original timestamp portion.
+The reassignment derives a new BigBlueButton internal recording ID as `SHA1(destination meetingID)-timestamp`, renames every discovered format directory, updates corresponding metadata, preserves the original timestamp portion, and preserves metadata ownership and file attributes.
+
+After reassignment, Greenlight's normal `RecordingsSync` / Re-Sync can discover the recordings under the destination Room.
 
 ## Deleted recordings
 
