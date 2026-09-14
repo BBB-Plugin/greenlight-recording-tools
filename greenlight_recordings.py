@@ -289,7 +289,11 @@ meeting_id = room.meeting_id
 owner = room.user.email
 recordings = room.recordings.count
 not_found = 0
-api = BigBlueButtonApi.new(provider: room.user.provider)
+provider = room.user.provider
+if provider == 'bn' && ENV['LOADBALANCER_ENDPOINT'].to_s.empty? && !ENV['BIGBLUEBUTTON_ENDPOINT'].to_s.empty?
+  provider = 'greenlight'
+end
+api = BigBlueButtonApi.new(provider: provider)
 room.recordings.includes(:formats).find_each do |recording|
   begin
     api.delete_recordings(record_ids: recording.record_id)
@@ -319,7 +323,11 @@ meeting_id = room.meeting_id
 owner = room.user.email
 recordings = room.recordings.count
 not_found = 0
-api = BigBlueButtonApi.new(provider: room.user.provider)
+provider = room.user.provider
+if provider == 'bn' && ENV['LOADBALANCER_ENDPOINT'].to_s.empty? && !ENV['BIGBLUEBUTTON_ENDPOINT'].to_s.empty?
+  provider = 'greenlight'
+end
+api = BigBlueButtonApi.new(provider: provider)
 room.recordings.includes(:formats).find_each do |recording|
   begin
     api.delete_recordings(record_ids: recording.record_id)
