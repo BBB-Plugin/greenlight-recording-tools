@@ -134,6 +134,52 @@ def greenlight_rooms():
     return rooms
 
 
+def greenlight_room_details():
+    ruby = r'''
+Room.includes(:user).order(:name, :created_at).each do |room|
+  values = [room.meeting_id, room.friendly_id, room.user&.email.to_s, room.recordings.count, room.name]
+  puts values.map { |v| v.to_s.gsub("\t", " ") }.join("\t")
+end
+'''.strip()
+    out = run_greenlight_rails(ruby)
+    rows = []
+    for line in out.splitlines():
+        parts = line.split('\t')
+        if len(parts) >= 5:
+            rows.append({
+                'meeting_id': parts[0],
+                'friendly_id': parts[1],
+                'owner_email': parts[2],
+                'recordings': int(parts[3]),
+                'name': '\t'.join(parts[4:]),
+            })
+    return rows
+
+
+def resolve_greenlight_room(reference, detailed=False):
+    reference = reference.strip()
+    if not reference:
+        fail('Greenlight Room reference cannot be empty')
+
+    rooms = greenlight_room_details() if detailed else list(greenlight_rooms().values())
+
+    matches = [room for room in rooms if room['meeting_id'] == reference]
+    if matches:
+        return matches[0]
+
+    matches = [room for room in rooms if room['friendly_id'] == reference]
+    if matches:
+        return matches[0]
+
+    matches = [room for room in rooms if room['name'] == reference]
+    if not matches:
+        fail(f'Greenlight Room not found by meetingID, friendly_id, or exact name: {reference}')
+    if len(matches) > 1:
+        ids = ', '.join(room['meeting_id'] for room in matches)
+        fail(f'Multiple Greenlight Rooms have exact name {reference!r}; use meetingID or friendly_id instead: {ids}')
+    return matches[0]
+
+
 def room_provenance():
     detail = Counter()
     for r in discover_recordings():
@@ -178,6 +224,27 @@ def cmd_rooms(args):
             print(f'{count}\t{exists}\t{mid}\t{name}')
         else:
             print(f'{count}\t{mid}\t{name}')
+
+
+def cmd_greenlight_rooms(args):
+    rows = greenlight_room_details()
+    if args.owner:
+        print('COUNT\tMEETING_ID\tFRIENDLY_ID\tOWNER_EMAIL\tROOM_NAME')
+        for room in rows:
+            print(f"{room['recordings']}\t{room['meeting_id']}\t{room['friendly_id']}\t{room['owner_email']}\t{room['name']}")
+    else:
+        print('COUNT\tMEETING_ID\tFRIENDLY_ID\tROOM_NAME')
+        for room in rows:
+            print(f"{room['recordings']}\t{room['meeting_id']}\t{room['friendly_id']}\t{room['name']}")
+
+
+def cmd_room_info(args):
+    room = resolve_greenlight_room(args.room, detailed=True)
+    print(f"room name: {room['name']}")
+    print(f"meetingID: {room['meeting_id']}")
+    print(f"friendly ID: {room['friendly_id']}")
+    print(f"owner: {room['owner_email']}")
+    print(f"recordings: {room['recordings']}")
 
 
 def cmd_orphans(args):
@@ -365,11 +432,8 @@ def find_recording_formats(state, record_id):
     return found
 
 
-def validate_destination_room(destination_meeting_id):
-    room = greenlight_rooms().get(destination_meeting_id)
-    if not room:
-        fail(f'Destination meetingID is not an existing Greenlight room: {destination_meeting_id}')
-    return room
+def validate_destination_room(destination_reference):
+    return resolve_greenlight_room(destination_reference)
 
 
 def update_metadata_tree(tree, new_record_id, destination_meeting_id, room):
@@ -383,18 +447,29 @@ def update_metadata_tree(tree, new_record_id, destination_meeting_id, room):
         meeting.set('externalId', destination_meeting_id)
         if room.get('name'):
             meeting.set('name', room['name'])
+
     meta = root.find('meta')
-    if meta is not None:
-        def set_existing_meta(tag, value):
-            node = meta.find(tag)
-            if node is not None:
-                node.text = value
-        set_existing_meta('meetingId', destination_meeting_id)
-        set_existing_meta('bbb-context-id', room.get('friendly_id', ''))
-        if room.get('name'):
-            set_existing_meta('bbb-context-name', room['name'])
-            set_existing_meta('meeting-name', room['name'])
-            set_existing_meta('meetingName', room['name'])
+    if meta is None:
+        meta = ET.SubElement(root, 'meta')
+
+    def set_meta(tag, value, create=False):
+        node = meta.find(tag)
+        if node is None and create:
+            node = ET.SubElement(meta, tag)
+        if node is not None:
+            node.text = value
+
+    # Canonical fields used by Greenlight/BBB are always normalized, even on
+    # historical metadata that predates bbb-context-* fields.
+    set_meta('meetingId', destination_meeting_id, create=True)
+    if room.get('friendly_id'):
+        set_meta('bbb-context-id', room['friendly_id'], create=True)
+    if room.get('name'):
+        set_meta('bbb-context-name', room['name'], create=True)
+        # Update historical name variants when they are already present, but do
+        # not invent duplicate legacy fields on modern metadata.
+        set_meta('meeting-name', room['name'])
+        set_meta('meetingName', room['name'])
 
 
 def atomic_write_tree(tree, path):
@@ -502,22 +577,24 @@ def cmd_move_recording(args):
         fail(f'Greenlight recording not found: {args.record_id}')
     if len(matches) > 1:
         fail(f'RecordID appears in multiple states: {args.record_id}')
-    move_one(matches[0], args.to)
+    room = validate_destination_room(args.to)
+    move_one(matches[0], room['meeting_id'], room=room)
 
 
 def cmd_move_room(args):
     sources = {x.strip() for x in args.source_meeting_ids.split(',') if x.strip()}
     if not sources:
         fail('No source meetingID supplied')
-    if args.to in sources:
-        fail('Destination meetingID must not also be a source meetingID')
     room = validate_destination_room(args.to)
+    destination_meeting_id = room['meeting_id']
+    if destination_meeting_id in sources:
+        fail('Destination meetingID must not also be a source meetingID')
     matches = [r for r in discover_recordings() if r['meeting_id'] in sources]
     if not matches:
         fail('No eligible Greenlight recordings found for supplied source meetingID(s)')
     print(f'Found {len(matches)} eligible recording(s).')
     for record in matches:
-        move_one(record, args.to, room=room)
+        move_one(record, destination_meeting_id, room=room)
 
 
 def cmd_inspect(args):
@@ -544,6 +621,14 @@ def build_parser():
     cmd.add_argument('--check-greenlight', action='store_true', help='mark whether each meetingID currently exists as a Greenlight Room')
     cmd.add_argument('--missing-only', action='store_true', help='show only meetingIDs that do not currently exist as Greenlight Rooms; implies --check-greenlight')
     cmd.set_defaults(func=cmd_rooms)
+
+    cmd = sub.add_parser('greenlight-rooms', help='list all current Greenlight Rooms, including Rooms with zero recordings')
+    cmd.add_argument('--owner', '--with-owner', dest='owner', action='store_true', help='include the Greenlight owner email')
+    cmd.set_defaults(func=cmd_greenlight_rooms)
+
+    cmd = sub.add_parser('room-info', help='show one current Greenlight Room by meetingID, friendly_id, or exact name')
+    cmd.add_argument('room', help='meetingID, friendly_id, or exact Room name')
+    cmd.set_defaults(func=cmd_room_info)
 
     cmd = sub.add_parser('orphans', help='list recording meetingIDs that no longer exist as Greenlight Rooms')
     cmd.set_defaults(func=cmd_orphans)
@@ -575,12 +660,12 @@ def build_parser():
 
     cmd = sub.add_parser('move-recording', help='reassign one recording to an existing Greenlight Room')
     cmd.add_argument('record_id')
-    cmd.add_argument('--to', required=True, metavar='DESTINATION_MEETING_ID')
+    cmd.add_argument('--to', required=True, metavar='DESTINATION_ROOM', help='destination meetingID, friendly_id, or exact Room name')
     cmd.set_defaults(func=cmd_move_recording)
 
     cmd = sub.add_parser('move-room', help='reassign all recordings from one or more historical meetingIDs')
     cmd.add_argument('source_meeting_ids', help='one or more source meetingIDs separated by commas')
-    cmd.add_argument('--to', required=True, metavar='DESTINATION_MEETING_ID')
+    cmd.add_argument('--to', required=True, metavar='DESTINATION_ROOM', help='destination meetingID, friendly_id, or exact Room name')
     cmd.set_defaults(func=cmd_move_room)
 
     return parser
