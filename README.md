@@ -52,11 +52,15 @@ Full provenance report, including detail by observed historical room name and a 
 greenlight-recordings rooms
 ```
 
+This command is recording-driven: it discovers historical Room identities from BBB recording metadata, so current Greenlight Rooms with zero recordings are intentionally absent.
+
 Mark whether each historical meetingID still exists as a current Greenlight Room:
 
 ```bash
 greenlight-recordings rooms --check-greenlight
 ```
+
+`--check-greenlight` checks the historical meetingIDs discovered from recordings; it does not turn `rooms` into a complete Greenlight Room listing.
 
 Show only historical meetingIDs represented by recordings but missing from current Greenlight Rooms:
 
@@ -75,6 +79,34 @@ Equivalent compact orphan report:
 ```bash
 greenlight-recordings orphans
 ```
+
+## Current Greenlight Rooms
+
+List every current Room directly from Greenlight, including Rooms with zero recordings:
+
+```bash
+greenlight-recordings greenlight-rooms
+```
+
+The output includes the Greenlight recording count, `meeting_id`, `friendly_id`, and Room name.
+
+Include the owner email:
+
+```bash
+greenlight-recordings greenlight-rooms --owner
+```
+
+`--with-owner` is accepted as an alias for `--owner`.
+
+Show one current Room by `meeting_id`, `friendly_id`, or exact Room name:
+
+```bash
+greenlight-recordings room-info "Exact Room Name"
+greenlight-recordings room-info <meetingID>
+greenlight-recordings room-info <friendly_id>
+```
+
+The command shows Room name, `meeting_id`, `friendly_id`, owner, and current Greenlight recording count. If more than one Room has the same exact name, name lookup aborts and requires `meeting_id` or `friendly_id`.
 
 ## BigBlueButton internal meeting IDs
 
@@ -104,7 +136,7 @@ Before deletion, every discovered format-specific `metadata.xml` must pass the `
 greenlight-recordings inspect <recordID>
 ```
 
-This includes the external/Greenlight meetingID, internal meetingID, reference metadata path, and all discovered recording formats.
+This includes the external/Greenlight meetingID, internal meetingID, `bbb-context-id`, reference metadata path, and all discovered recording formats.
 
 ## Create a Greenlight Room
 
@@ -142,23 +174,32 @@ Both commands fail without changing anything when zero or multiple Rooms have th
 
 ## Reassignment
 
-Move one recording to an existing destination Greenlight Room:
+Move one recording to an existing destination Greenlight Room. The destination may be the Room `meeting_id`, `friendly_id`, or exact unique Room name:
 
 ```bash
 greenlight-recordings move-recording <recordID> --to <destination-meetingID>
+greenlight-recordings move-recording <recordID> --to <destination-friendly-id>
+greenlight-recordings move-recording <recordID> --to "Exact Destination Room Name"
 ```
 
-Move all eligible recordings belonging to one or several historical meetingIDs:
+Move all eligible recordings belonging to one or several historical meetingIDs using the same destination forms:
 
 ```bash
 greenlight-recordings move-room <source-meetingID[,source-meetingID,...]> --to <destination-meetingID>
+greenlight-recordings move-room <source-meetingID[,source-meetingID,...]> --to "Exact Destination Room Name"
 ```
+
+Destination name lookup is exact and must resolve to exactly one current Greenlight Room. Ambiguous names abort before modifying recordings.
 
 Before a recording modification, every format-specific metadata file found for that recording must explicitly have `bbb-origin=greenlight`. If any format fails that invariant, the operation aborts.
 
 The reassignment derives a new BigBlueButton internal recording ID as `SHA1(destination meetingID)-timestamp`, renames every discovered format directory, updates corresponding metadata, preserves the original timestamp portion, and preserves metadata ownership and file attributes.
 
-After reassignment, Greenlight's normal `RecordingsSync` / Re-Sync can discover the recordings under the destination Room.
+For historical metadata, reassignment now creates the canonical `meetingId`, `bbb-context-id`, and `bbb-context-name` fields when they are missing. `bbb-context-id` is normalized to the destination Greenlight Room `friendly_id`, matching Greenlight's current meeting metadata behavior. Existing legacy room-name metadata variants are updated when present.
+
+Greenlight itself associates a synchronized recording to a Room from the recording `meetingId`/`meetingID` and stores that relationship in its database. `bbb-context-id` is useful descriptive metadata but is not the database foreign-key mechanism.
+
+After reassignment, Greenlight's normal `RecordingsSync` / Re-Sync can discover the recordings under the destination Room. The move commands normalize BBB recording metadata; they do not implicitly run Greenlight Re-Sync.
 
 ## Deleted recordings
 
